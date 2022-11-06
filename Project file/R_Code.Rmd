@@ -1,0 +1,496 @@
+```{R}
+library(affy)
+library(tidyverse)
+library(GEOquery)
+library(dplyr)
+library(limma)
+```
+
+```{R}
+## Initial download and normalization process courtesy of Khushbu Patel
+## https://www.youtube.com/watch?v=TtlvC67pdOM
+
+## Download and extract raw data ##
+getGEOSuppFiles("GSE28358")
+untar("GSE28358/GSE28358_RAW.tar", exdir = "Data/")
+
+## Normalization ##
+raw.data.GEO <- ReadAffy(celfile.path = "Data/")
+norm.data <- rma(raw.data.GEO) # RMA normalization
+norm.expr <- as.data.frame(exprs(norm.data))
+
+## Removing the file suffix ##
+col.names <- unlist(strsplit(colnames(norm.expr), split = '.', fixed = TRUE))
+col.names <- col.names[!(col.names == "CEL" | col.names == "gz")]
+colnames(norm.expr) <- col.names
+
+## Extract probe ID and Gene Code ##
+gse <- getGEO("GSE28358", GSEMatrix = TRUE)
+feature.data <- gse$GSE28358_series_matrix.txt.gz@featureData@data
+
+## Partition data ##
+# Extract sample name, intervention type, timepoint #
+sample.data <- gse$GSE28358_series_matrix.txt.gz@phenoData@data[, c(1, 33, 34)]
+colnames(sample.data) <- c("Title", "Intervention", "Timepoint")
+
+olive <- subset(sample.data, sample.data$Intervention == "olive oil")
+nuts <- subset(sample.data, sample.data$Intervention == "nuts")
+low.fat <- subset(sample.data, sample.data$Intervention == "low fat")
+
+## Mapping probes to gene ID ##
+subs.feature <- feature.data[, c(1, 11)]
+norm.expr$ID <- rownames(norm.expr)
+norm.expr <- norm.expr[,c(ncol(norm.expr),1:(ncol(norm.expr)-1))]
+norm.expr <- merge(norm.expr, subs.feature, by = "ID")
+norm.expr <- norm.expr[,c(ncol(norm.expr),1:(ncol(norm.expr)-1))]
+
+## Removing null mapping ##
+norm.expr <- norm.expr[!norm.expr$`Gene Symbol` == "", ]
+
+## Averaging repeated genes ##
+average.genes <- function(data) {
+new.data <- data %>% ## Credits to Martin Gal from https://stackoverflow.com/questions/69918036/collapse-rows-with-duplicate-id-and-average-values-of-all-other-variables
+  group_by(`Gene Symbol`) %>%
+  summarise(across(where(is.numeric), mean))
+return(new.data)
+}
+norm.expr <- average.genes(norm.expr)
+
+## Store gene names##
+genes <- norm.expr$`Gene Symbol`
+ngenes <- nrow(norm.expr)
+norm.expr <- as.data.frame(norm.expr[,2:ncol(norm.expr)])
+rownames(norm.expr) <- genes
+
+## Subset transcriptomic data ##
+olive.gene <- norm.expr[, c(match(rownames(olive), colnames(norm.expr)))]
+nuts.gene <- norm.expr[, c(match(rownames(nuts), colnames(norm.expr)))]
+lowfat.gene <- norm.expr[, c(match(rownames(low.fat), colnames(norm.expr)))]
+
+## Separate each intervention by before and after ##
+olive.intervention <- list("Before" = olive.gene[,rownames(olive[olive$Timepoint == "baseline",])], 
+                           "After" = olive.gene[,rownames(olive[olive$Timepoint == "3 months",])])
+nuts.intervention <- list("Before" = nuts.gene[,rownames(nuts[nuts$Timepoint == "baseline",])], 
+                           "After" = nuts.gene[,rownames(nuts[nuts$Timepoint == "3 months",])])
+lowfat.intervention <- list("Before" = lowfat.gene[,rownames(low.fat[low.fat$Timepoint == "baseline",])], 
+                           "After" = lowfat.gene[,rownames(low.fat[low.fat$Timepoint == "3 months",])])
+All.intervention <- list("Before" = norm.expr[,rownames(sample.data[sample.data$Timepoint == "baseline",])], 
+                           "After" = norm.expr[,rownames(sample.data[sample.data$Timepoint == "3 months",])])
+```
+
+``` {R}
+## Checking if each gene is normally distributed ##
+norm.bpval <- norm.apval <- rep(0, ngenes)
+
+for(i in 1:ngenes) {
+  norm.bpval[i] <- shapiro.test(as.numeric(All.intervention$Before[i, ]))$p.value
+  norm.apval[i] <- shapiro.test(as.numeric(All.intervention$After[i, ]))$p.value
+}
+
+sum(norm.bpval <= 0.05)/ngenes # 20.8% of pre-intervention genes are non-normal
+sum(norm.apval <= 0.05)/ngenes # 17.1% of post-intervention genes are non-normal 
+
+not.normal <- unique(c(which(norm.bpval <= 0.05), which(norm.apval <= 0.05))) # Not normally distributed (Wilcox test)
+normal <- seq(1, ngenes)[-not.normal] # Normally distributed (t-test)
+```
+
+```{R}
+## Wilcox and t-test for differential expression ##
+pvals.olive <- pvals.nuts <- pvals.lf <- rep(2, ngenes)
+names(pvals.olive) <- names(pvals.nuts) <- names(pvals.lf) <- genes
+
+# Wilcox test on non-normal distributed genes#
+for(i in not.normal) {
+  pvals.olive[i] <- wilcox.test(as.numeric(olive.intervention$Before[i,]), as.numeric(olive.intervention$After[i,]))$p.value
+  pvals.nuts[i] <- wilcox.test(as.numeric(nuts.intervention$Before[i,]), as.numeric(nuts.intervention$After[i,]))$p.value
+  pvals.lf[i] <- wilcox.test(as.numeric(lowfat.intervention$Before[i,]), as.numeric(lowfat.intervention$After[i,]))$p.value
+}
+
+# T-test on normal distributed genes
+for(i in normal) { 
+  pvals.olive[i] <- t.test(as.numeric(olive.intervention$Before[i,]), as.numeric(olive.intervention$After[i,]))$p.value
+  pvals.nuts[i] <- t.test(as.numeric(nuts.intervention$Before[i,]), as.numeric(nuts.intervention$After[i,]))$p.value
+  pvals.lf[i] <- t.test(as.numeric(lowfat.intervention$Before[i,]), as.numeric(lowfat.intervention$After[i,]))$p.value
+}
+
+threshold <- 0.05
+
+sum(pvals.olive <= threshold) # 388 significant genes TMD + VOO
+sum(pvals.nuts <= threshold) # 643 significant genes TMD + Nuts
+sum(pvals.lf <= threshold) # 556 significant genes LFD
+
+# P-value histogram, non-uniform suggest improper test #
+hist(pvals.olive, main = "P-value distribution (t-test) olive", xlab = "P-values")
+hist(pvals.nuts, main = "P-value distribution (t-test) nuts", xlab = "P-values")
+hist(pvals.lf, main = "P-value distribution (t-test) control", xlab = "P-values")
+```
+
+```{R}
+## PCA Plots, using all genes ##
+library(PCAtools)
+PCA <- pca(norm.expr)
+biplot(PCA, lab = as.factor(sample.data$Intervention))
+biplot(PCA, lab = as.factor(sample.data$Timepoint), labSize = 0, legendPosition = 'left', encircle = TRUE)
+
+## Plot before after for TMD + VOO ##
+PCA.olive <- pca(olive.gene)
+biplot(PCA.olive, lab = as.factor(olive$Timepoint), encircle = TRUE)
+
+## Plot before after for TMD + Nuts ##
+PCA.nuts <- pca(nuts.gene)
+biplot(PCA.nuts, lab = as.factor(nuts$Timepoint), encircle = TRUE)
+
+## Plot before after for LFD ##
+PCA.lf <- pca(lowfat.gene)
+biplot(PCA.lf, lab = as.factor(low.fat$Timepoint), encircle = TRUE)
+```
+
+```{R}
+## Expression Densities, unused in report ##
+plotDensity(olive.intervention$After) 
+plotDensity(nuts.intervention$After) 
+plotDensity(lowfat.intervention$After) 
+```
+
+```{R}
+## SAM on dataset ##
+library(samr)
+
+# Olive #
+y <- c(-(1:11), (1:11))
+x <- as.matrix(cbind(olive.intervention$Before, olive.intervention$After))
+d = list(x = x, y = y, geneid = as.character(1:nrow(x)), genenames = as.character(genes), logged2 = TRUE)
+samr.olive <- samr(d, resp.type = "Two class paired", nperms = 200)
+
+samp.olive <- samr.pvalues.from.perms(samr.olive$tt, samr.olive$ttstar) # P-values
+
+## Quality control plots: hypothesis that significant LF change is at 0.56
+## X-axis: hypothesized truly non-significant genes and called significant genes
+## Unused in report
+qc.olive <- samr.assess.samplesize(samr.olive, data = d, dif = 0.56)
+samr.assess.samplesize.plot(qc.olive)
+
+# Nuts #
+y <- c(-(1:11),(1:11))
+x <- as.matrix(cbind(nuts.intervention$Before, nuts.intervention$After))
+d <- list(x = x, y = y, geneid = as.character(1:nrow(x)), genenames = genenames = as.character(genes), logged2 = TRUE)
+samr.nuts <- samr(d, assay.type = "array", resp.type = "Two class paired", nperms = 200)
+samp.nuts <- samr.pvalues.from.perms(samr.nuts$tt, samr.nuts$ttstar)
+
+## Quality control
+qc.nuts <- samr.assess.samplesize(samr.nuts, data = d, dif = 0.56) # Quality control
+samr.assess.samplesize.plot(qc.nuts)
+
+# Low fat #
+y <- c(-(1:9),(1:9))
+x <- as.matrix(cbind(lowfat.intervention$Before, lowfat.intervention$After[,1:9]))
+d <- list(x = x, y = y, geneid = as.character(1:nrow(x)), genenames = genenames = as.character(genes), logged2 = TRUE)
+samr.lf <- samr(d, resp.type = "Two class paired", nperms = 200)
+samp.lf <- samr.pvalues.from.perms(samr.lf$tt, samr.lf$ttstar)
+
+## Quality control
+qc.lf <- samr.assess.samplesize(samr.lf, data = d, dif = 0.56) # Quality control
+samr.assess.samplesize.plot(qc.lf)
+```
+
+```{R}
+# P-value SAM Histograms #
+names(samp.olive) <- names(samp.nuts) <- names(samp.lf) <- genes
+
+hist(samp.olive, main = "P-value distribution (SAM) olive", xlab = "P-values")
+hist(samp.nuts, main = "P-value distribution (SAM) nuts", xlab = "P-values") # Special care for this
+hist(samp.lf, main = "P-value distribution (SAM) control", xlab = "P-values")
+
+
+sum(samp.olive <= 0.01)
+sum(samp.nuts <= 0.01)
+sum(samp.lf <= 0.01)
+```
+
+```{R}
+## Extracting significant Genes ##
+olive.signif <- as.data.frame(x = genes[which(samp.olive <= 0.05)])
+
+nuts.signif <- genes[which(samp.nuts <= 0.05)]
+lf.signif <- genes[which(samp.lf <= 0.05)]
+```
+
+```{R}
+## T-test between interventions ##
+
+pval.on <- pval.olf <- pval.nlf <- rep(0, ngenes)
+names(pval.on) <- names(pval.olf) <- names(pval.nlf) <- rownames(norm.expr)
+
+# pval.on: compare olive and nuts diet
+# pval.olf: compare olive and low fat diet
+# pval.nlf: compare nuts and low fat diet
+for(i in 1:nrow(norm.expr)) {
+  pval.on[i] <- t.test(olive.intervention$After[i,], nuts.intervention$After[i,])$p.value
+  pval.olf[i] <- t.test(olive.intervention$After[i,], lowfat.intervention$After[i,])$p.value
+  pval.nlf[i] <- t.test(nuts.intervention$After[i,], lowfat.intervention$After[i,])$p.value
+}
+
+hist(pval.on)
+hist(pval.olf)
+hist(pval.nlf)
+
+names(which(pval.on <= 0.01))
+names(which(pval.olf <= 0.01))
+names(which(pval.nlf <= 0.01))
+
+```
+
+```{R}
+## One-way ANOVA for across all 3 interventions ##
+groups <- c(rep("VOO", 11), rep("Nuts", 11), rep("LF", 12))
+all.after <- cbind(olive.intervention$After, nuts.intervention$After, lowfat.intervention$After)
+pval.aov <- rep (0, ngenes)
+names(pval.aov) <- genes
+
+for(i in 1:ngenes) {
+  res.aov <- aov(as.numeric(all.after[i,]) ~ groups)
+  pval.aov[i] <- summary(res.aov)[[1]][["Pr(>F)"]][1]
+}
+
+adj.aov <- p.adjust(pval.aov, method = "fdr") # FDR p-value adjustment
+```
+
+```{R}
+# Heatmaps before and after intervention for each diet #
+
+library(RColorBrewer)
+library(gplots)
+
+colnames(olive.intervention$Before) <- paste(colnames(olive.intervention$Before), "(O, B)")
+colnames(olive.intervention$After) <- paste(colnames(olive.intervention$After), "(O, A)")
+colnames(nuts.intervention$Before) <- paste(colnames(nuts.intervention$Before), "(N, B)")
+colnames(nuts.intervention$After) <- paste(colnames(nuts.intervention$After), "(N, A)")
+colnames(lowfat.intervention$Before) <- paste(colnames(lowfat.intervention$Before), "(L, B)")
+colnames(lowfat.intervention$After) <- paste(colnames(lowfat.intervention$After), "(L, A)")
+
+## Olive before and after ##
+o.bf <- cbind(olive.intervention$Before, olive.intervention$After)
+rownames(o.bf) <- genes
+top50 <- names(sort(samp.olive, decreasing = FALSE)[1:50])
+
+heatmap.2(as.matrix(o.bf[top25, ]),  Colv = TRUE, Rowv = NULL, scale = "row",density.info="none", trace="none", col = brewer.pal(11,"RdBu"), main = "TMD + VOO Before-After intervention")
+
+
+## Nuts before and after ##
+n.bf <- cbind(nuts.intervention$Before, nuts.intervention$After)
+rownames(n.bf) <- rownames(nuts.intervention$Before)
+top50 <- names(sort(samp.nuts, decreasing = FALSE)[1:50])
+
+heatmap.2(as.matrix(n.bf[top50, ]),  Colv = TRUE, Rowv = NULL, scale = "row",density.info="none", trace="none", col = brewer.pal(11,"RdBu"), main = "TMD + Nuts Before-After intervention")
+
+
+## LF before and after ##
+lf.bf <- cbind(lowfat.intervention$Before, lowfat.intervention$After)
+rownames(lf.bf) <- rownames(lowfat.intervention$Before)
+top50 <- names(sort(samp.lf, decreasing = FALSE)[1:50])
+
+heatmap.2(as.matrix(lf.bf[top50, ]),  Colv = TRUE, Rowv = NULL, scale = "row",density.info="none", trace="none", col = brewer.pal(11,"RdBu"), main = "LF Before-After intervention")
+```
+
+```{R}
+# Heatmaps between interventions #
+
+## Olive vs Nuts ##
+on.bf <- cbind(olive.intervention$After, nuts.intervention$After)
+rownames(on.bf) <- genes
+top50 <- names(sort(pval.on, decreasing = FALSE)[1:50])
+
+heatmap.2(as.matrix(on.bf[top50, ]),  Colv= TRUE, Rowv = NULL, scale = "row",density.info="none", trace="none", col = brewer.pal(11,"RdBu"), main = "TMD + VOO and TMD + Nuts After")
+
+## Olive vs LF ##
+ol.bf <- cbind(olive.intervention$After, lowfat.intervention$After)
+rownames(ol.bf) <- genes
+top50 <- names(sort(pval.olf, decreasing = FALSE)[1:50])
+
+heatmap.2(as.matrix(ol.bf[top50, ]),  Colv= TRUE, Rowv = NULL, scale = "row",density.info="none", trace="none", col = brewer.pal(11,"RdBu"), main = "TMD + VOO and LF After")
+
+## Nuts vs LF ##
+nl.bf <- cbind(nuts.intervention$After, lowfat.intervention$After)
+rownames(nl.bf) <- genes
+top50 <- names(sort(pval.nlf, decreasing = FALSE)[1:50])
+
+heatmap.2(as.matrix(nl.bf[top50, ]),  Colv= TRUE, Rowv = NULL, scale = "row",density.info="none", trace="none", col = brewer.pal(11,"RdBu"), main = "TMD + Nuts and LF After")
+
+## Heatmap between all 3 interventions ##
+all.bf <- cbind(olive.intervention$After, nuts.intervention$After, lowfat.intervention$After)
+rownames(all.bf) <- genes
+top50 <- names(which(p.adjust(samp.tot, method = "fdr") <= 0.1))
+
+heatmap.2(as.matrix(all.bf[top50, ]),  Colv= TRUE, Rowv = NULL, scale = "row",density.info="none", trace="none", col = brewer.pal(11,"RdBu"), main = "Heatmap between ALL interventions")
+```
+
+```{R}
+## PCA top 100 significant genes ##
+
+# Olive #
+top100 <- names(sort(samp.olive, decreasing = FALSE)[1:100])
+biplot(pca(o.bf[top100, ]), lab = as.factor(c(rep("Before", 11), rep("After", 11))), encircle = TRUE, title = "TMD + VOO PCA (top 100 genes)")
+
+# Nuts #
+top100 <- names(sort(samp.nuts, decreasing = FALSE)[1:100])
+biplot(pca(n.bf[top100, ]), lab = as.factor(c(rep("Before", 11), rep("After", 11))), encircle = TRUE, title = "TMD + Nuts PCA (top 100 genes)")
+
+# LF #
+top100 <- names(sort(samp.lf, decreasing = FALSE)[1:100])
+biplot(pca(lf.bf[top100, ]), lab = as.factor(c(rep("Before", 9), rep("After", 12))), encircle = TRUE, title = "LF PCA (top 100 genes)")
+
+## Olive vs Nuts ##
+top100 <- names(sort(pval.on, decreasing = FALSE)[1:100])
+biplot(pca(on.bf[top100, ]), lab = as.factor(c(rep("Nuts", 11), rep("VOO", 11))), encircle = TRUE, title = "TMD + VOO vs TMD + Nuts PCA (top 100 genes)")
+
+## Olive vs LF ##
+top100 <- names(sort(pval.olf, decreasing = FALSE)[1:100])
+biplot(pca(ol.bf[top100, ]), lab = as.factor(c(rep("VOO", 11), rep("LF", 12))), encircle = TRUE, title = "TMD + VOO vs LF PCA (top 100 genes)")
+
+## Nuts vs LF ##
+top100 <- names(sort(pval.nlf, decreasing = FALSE)[1:100])
+biplot(pca(nl.bf[top100, ]), lab = as.factor(c(rep("Nuts", 11), rep("LF", 12))), encircle = TRUE, title = "TMD + Nuts vs LF PCA (top 100 genes)")
+
+## ALL 3 interventions, used top 50 genes ##
+all.bf <- cbind(olive.intervention$After, nl.bf)
+top50 <- names(sort(pval.aov, decreasing = FALSE)[1:50])
+biplot(pca(all.bf[top50, ]), lab = as.factor(c(rep("VOO", 11), rep("Nuts", 11), rep("LF", 12))), encircle = TRUE, title = "All interventions PCA (top 50 genes, ANOVA)")
+
+```
+
+```{R}
+## Boxplots of IL6, IL1A and TNF before and after intervention##
+IL6 <- list("Baseline" = unlist(All.intervention$Before["IL6", ]), "After"= unlist(All.intervention$After["IL6", ]))
+IL1A <- list("Baseline" =unlist(All.intervention$Before["IL1A", ]), "After"= unlist(All.intervention$After["IL1A", ]))
+TNF <- list("Baseline" =unlist(All.intervention$Before["TNF", ]), "After"= unlist(All.intervention$After["TNF", ]))
+
+boxplot(IL1A, ylab = "Log2fold change IL1A", main = "A")
+boxplot(IL6, ylab = "Log2fold change IL6", main = "B")
+boxplot(TNF, ylab = "Log2fold change TNF", main = "C")
+```
+
+```{R}
+## Volcano Plots + saving CSV for pathway analysis ##
+
+library(ggplot2)
+library(EnhancedVolcano)
+library(stringr)
+
+# VOO #
+control.olive <- apply(olive.intervention$Before, 1, mean)
+test.olive <- apply(olive.intervention$After, 1, mean)
+foldchange <- control.olive - test.olive
+
+results <- as.data.frame(cbind(foldchange, samp.olive))
+
+## SAVE CSV ##
+str <- strsplit(rownames(results), "///")
+indiv.words <- unlist(str)
+indiv.words <- str_trim(indiv.words) # Removes the white spaces
+process <- data.frame("Gene Symbol" = indiv.words, results[rep(1:nrow(results), sapply(str, length)), c(1,2)])
+
+process <- process %>% ## Credits to Martin Gal from https://stackoverflow.com/questions/69918036/collapse-rows-with-duplicate-id-and-average-values-of-all-other-variables
+  group_by(Gene.Symbol) %>%
+  summarise(across(where(is.numeric), mean))
+
+write.csv(process, "CSVs/Olive.csv", row.names = FALSE)
+
+## PLOT ##
+EnhancedVolcano(results, lab = rownames(results), x = "foldchange", y = "samp.olive", pCutoff = 0.05, FCcutoff = 3 * sd(foldchange), hline = 0.01, hlineCol = "darkgreen", cutoffLineWidth = 1, hlineWidth = 0.8, xlim = c(-2, 2), ylim = c(0, 4), pointSize = 3, title = "VOO before/after intervention")
+
+downregulated.olive <- results[(results$foldchange >= 3 * sd(foldchange)) & (samp.olive <= 0.05), ]
+upregulated.olive<- results[(results$foldchange <= -3 * sd(foldchange)) & (samp.olive <= 0.05), ]
+olive.change <- rbind.data.frame(downregulated.olive, upregulated.olive) # General differential expression
+
+## ---------------------------------------------------- ##
+
+## Nuts ##
+control.nuts <- apply(nuts.intervention$Before, 1, mean)
+test.nuts <- apply(nuts.intervention$After, 1, mean)
+foldchange <- control.nuts - test.nuts
+
+results <- as.data.frame(cbind(foldchange, samp.nuts))
+
+## SAVE CSV ##
+str <- strsplit(rownames(results), "///")
+indiv.words <- unlist(str)
+indiv.words <- str_trim(indiv.words) # Removes the white spaces
+process <- data.frame("Gene Symbol" = indiv.words, results[rep(1:nrow(results), sapply(str, length)), c(1,2)])
+
+process <- process %>% ## Credits to Martin Gal from https://stackoverflow.com/questions/69918036/collapse-rows-with-duplicate-id-and-average-values-of-all-other-variables
+  group_by(Gene.Symbol) %>%
+  summarise(across(where(is.numeric), mean))
+
+write.csv(process, "CSVs/Nuts.csv", row.names = FALSE)
+
+## PLOT ##
+EnhancedVolcano(results, lab = rownames(results), x = "foldchange", y = "samp.nuts", pCutoff = 0.05, FCcutoff = 3 * sd(foldchange), hline = 0.01, hlineCol = "darkgreen", cutoffLineWidth = 1, hlineWidth = 0.8, xlim = c(-2.8, 2.8), ylim = c(0, 6), pointSize = 3, title = "Nuts before/after intervention")
+
+downregulated.nuts <- results[(results$foldchange >= 3 * sd(foldchange)) & (samp.nuts <= 0.05), ]
+upregulated.nuts <- results[(results$foldchange <= -3 * sd(foldchange)) & (samp.nuts <= 0.05), ]
+nuts.change <- rbind.data.frame(downregulated.nuts, upregulated.nuts) # General differential expression
+
+## ---------------------------------------------------- ##
+
+
+## LF ##
+control.lf <- apply(lowfat.intervention$Before, 1, mean)
+test.lf <- apply(lowfat.intervention$After, 1, mean)
+foldchange <- control.lf - test.lf
+results <- as.data.frame(cbind(foldchange, samp.lf))
+
+## SAVE CSV ##
+str <- strsplit(rownames(results), "///")
+indiv.words <- unlist(str)
+indiv.words <- str_trim(indiv.words) # Removes the white spaces
+process <- data.frame("Gene Symbol" = indiv.words, results[rep(1:nrow(results), sapply(str, length)), c(1,2)])
+
+process <- process %>% ## Credits to Martin Gal from https://stackoverflow.com/questions/69918036/collapse-rows-with-duplicate-id-and-average-values-of-all-other-variables
+  group_by(Gene.Symbol) %>%
+  summarise(across(where(is.numeric), mean))
+
+write.csv(process, "CSVs/LF.csv", row.names = FALSE)
+
+## PLOT ##
+EnhancedVolcano(results, lab = rownames(results), x = "foldchange", y = "samp.lf", pCutoff = 0.05, FCcutoff = 3 * sd(foldchange), hline = 0.01, hlineCol = "darkgreen", cutoffLineWidth = 1, hlineWidth = 0.8, xlim = c(-2.2, 2.2), ylim = c(0, 4), pointSize = 3, title = "Lowfat diet before/after intervention")
+
+downregulated.lf <- results[(results$foldchange >= 3 * sd(foldchange)) & (samp.lf <= 0.05), ]
+upregulated.lf <- results[(results$foldchange <= -3 * sd(foldchange)) & (samp.lf <= 0.05), ]
+lf.change <- rbind.data.frame(downregulated.lf, upregulated.lf) # General differential expression
+
+```
+
+```{R}
+## Identifying related pathways, file created using PathVisio ##
+
+olive.path <- read.table("Pathway Analysis/VOO.txt",sep="\t", header=TRUE)
+olive.signifpath <- olive.path[olive.path$positive..r. >= 5 & olive.path$Z.Score >= 1.96,]
+
+nuts.path <- read.table("Pathway Analysis/Nuts.txt",sep="\t", header=TRUE)
+nuts.signifpath <- nuts.path[nuts.path$positive..r. >= 5 & nuts.path$Z.Score >= 1.96,]
+
+lf.path <- read.table("Pathway Analysis/Lowfat.txt",sep="\t", header=TRUE)
+lf.signifpath <- lf.path[lf.path$positive..r. >= 5 & lf.path$Z.Score >= 1.96,]
+
+VOOnuts.path <- inner_join(olive.signifpath, nuts.signifpath, by = "Pathway") 
+commonpath <- inner_join(VOOnuts.path, lf.signifpath, by = "Pathway") 
+
+## Unique Pathways ##
+
+# VOO only pathway
+VnotN <- setdiff(olive.signifpath$Pathway, nuts.signifpath$Pathway)
+VnotNnotL <- setdiff(VnotN, lf.signifpath$Pathway)
+
+# Nuts only pathway
+NnotV <- setdiff(nuts.signifpath$Pathway, olive.signifpath$Pathway)
+NnotVnotL <- setdiff(NnotV, lf.signifpath$Pathway)
+
+# Lowfat only pathway
+LnotV  <- setdiff(lf.signifpath$Pathway, olive.signifpath$Pathway)
+LnotVnotN <- setdiff(LnotV, nuts.signifpath$Pathway)
+
+# TMD vs Control
+TMDonly <- setdiff(VOOnuts.path$Pathway, lf.signifpath$Pathway)
+lowfatonly <- setdiff( lf.signifpath$Pathway, VOOnuts.path$Pathway)
+```
+
